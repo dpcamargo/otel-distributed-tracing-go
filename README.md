@@ -1,9 +1,12 @@
 # End-to-End Distributed Observability Pipeline
 
-Two Go microservices instrumented with OpenTelemetry, exporting distributed
-traces to both Jaeger and Zipkin (via an OTel Collector) and metrics to
-Prometheus/Grafana — built around a small "ZIP code → weather" use case to
-have something concrete to trace.
+## Purpose
+
+Two Go microservices instrumented with OpenTelemetry, exporting a single
+connected distributed trace per request to both Jaeger and Zipkin (via an
+OTel Collector), plus runtime/service metrics to Prometheus/Grafana — built
+around a small "ZIP code → weather" use case so there's something concrete
+to trace end-to-end, including calls to two real external APIs.
 
 - **service-a**: receives a ZIP code (Brazilian CEP) via POST, validates its
   shape, forwards it to service-b.
@@ -14,6 +17,22 @@ have something concrete to trace.
   OpenTelemetry span, propagated across the HTTP boundary via W3C
   `traceparent` headers, so a single request produces one connected trace
   from edge to external API calls.
+
+## Technologies
+
+- **Go** — both services (`net/http`, no framework)
+- **OpenTelemetry SDK** (`go.opentelemetry.io/otel`) — tracing instrumentation,
+  `BatchSpanProcessor`, `AlwaysSample` sampler, W3C trace-context propagation
+- **OpenTelemetry Collector** — receives OTLP/gRPC from both services, fans
+  out to Jaeger and Zipkin, exposes Prometheus-format metrics
+- **Jaeger** and **Zipkin** — two independent trace storage/query backends
+  fed from the same collector pipeline
+- **Prometheus** + **Grafana** — scrapes `/metrics` on both services plus
+  the collector's own metrics endpoint
+- **ViaCEP** and **WeatherAPI** — the two external HTTP APIs the trace
+  extends into
+- **Docker Compose** — orchestrates both services + collector + Jaeger +
+  Zipkin + Prometheus + Grafana as one stack
 
 ## Architecture
 
@@ -35,11 +54,11 @@ flowchart LR
     B -.->|/metrics scrape| Prometheus
 ```
 
-The collector fans each trace out to **two** backends simultaneously
-(Jaeger via OTLP, Zipkin via its native format) — see "Tradeoff: dual trace
-backends" below for why that's in the pipeline.
+The collector is the only thing that knows about Jaeger and Zipkin —
+both services only ever emit OTLP. It fans each trace out to **two**
+backends simultaneously (see "Tradeoff: dual trace backends" below).
 
-### Request sequence (single connected trace across 2 services + 2 external APIs)
+## Execution flow
 
 ```mermaid
 sequenceDiagram
@@ -54,9 +73,7 @@ sequenceDiagram
     A->>A: span "service-a" starts<br/>validateZip()
     A->>B: GET /?zip=... (traceparent header injected)
     B->>B: span "service-b" starts<br/>(extracts traceparent, same trace)
-    B->>V: span "outgoing request to service-b"... 
-    Note over A,B: span "outgoing request to service-b" wraps this hop
-    B->>V: GET /ws/{zip}/json/
+    B->>V: GET /ws/{zip}/json/<br/>(span "outgoing request to service-b" wraps this hop)
     V-->>B: {"localidade": "São Paulo"}
     B->>W: span "outgoing request to weatherapi"
     B->>W: GET /v1/current.json?q=São Paulo
@@ -69,8 +86,23 @@ sequenceDiagram
     end
 ```
 
-A real captured trace for this flow (via `GET /api/traces` on Jaeger,
-`docker compose up`, single request, no load):
+1. The client POSTs a CEP to service-a; a root span named `service-a` is
+   started and the request's trace context is what every downstream span
+   attaches to.
+2. service-a validates the CEP shape and forwards it to service-b over
+   HTTP, injecting the current trace context into the outgoing
+   `traceparent` header so the call is a child of the `service-a` span.
+3. service-b extracts that header, starts its own `service-b` span as a
+   child of it, then calls ViaCEP (to resolve the CEP to a city) and
+   WeatherAPI (to fetch that city's weather), each wrapped in its own span.
+4. The response — city name plus temperature in Celsius/Fahrenheit/Kelvin —
+   flows back up through service-b and service-a to the client.
+5. Independently of the response path, both services batch-export their
+   finished spans to the OTel Collector over OTLP/gRPC; the collector fans
+   them out to Jaeger and Zipkin and exposes derived metrics to Prometheus.
+
+A real captured trace for this flow (via Jaeger's `/api/traces`, single
+request, no load) shows the full per-hop latency breakdown:
 
 | Span                              | Duration | Parent                  |
 |------------------------------------|---------:|---------------------------|
@@ -81,25 +113,10 @@ A real captured trace for this flow (via `GET /api/traces` on Jaeger,
 
 Reading this bottom-up: the WeatherAPI call is 83.6ms of the 369.1ms
 `service-b` span — the rest is the (uninstrumented) ViaCEP call plus JSON
-parsing. This kind of breakdown, for free, from three lines of SDK code per
-hop, is the actual value proposition of the pipeline — it's what let me find
-and fix the bug below.
+parsing. That breakdown, for free from three lines of SDK code per hop, is
+the pipeline's actual value proposition.
 
-## A real bug this instrumentation caught
-
-While validating this pipeline, `getTempFromLocal` in service-a was
-starting its outgoing-call span from `context.Background()` instead of
-from the request's context — so the "outgoing request to service-b" span
-was its own disconnected root trace, never linked to the parent `service-a`
-span or to `service-b`'s own span. The three spans existed, but the trace
-view showed three unrelated single-span traces instead of one connected
-call chain. Fixed in `cmd/service-a/main.go` by threading `ctx` through
-`getTempFromLocal` and using `http.NewRequestWithContext` so the propagated
-`traceparent` header and the local span's parent agree. This is the kind of
-bug that's invisible in logs and only shows up as "why does my trace have
-gaps" in the tracing UI — which is exactly why the instrumentation exists.
-
-## Configuration
+## Running it
 
 ```sh
 docker compose up -d --build
@@ -119,14 +136,7 @@ curl --request POST --url http://localhost:8080/ \
 ```
 
 `zip.http` has ready-to-run requests for the VS Code REST Client extension;
-fill in your own `api_key` (never commit a real key — see note below).
-
-> **Security note:** an earlier version of `zip.http` in this repo's history
-> had a live WeatherAPI key committed in plaintext. It has been removed from
-> the current file content and should be treated as compromised — if it's
-> yours, rotate it at weatherapi.com. Git history still contains it until
-> the history itself is rewritten/force-pushed, which is a separate,
-> deliberate action.
+fill in your own `api_key` — never commit a real key to this file.
 
 ## Testing
 
@@ -135,17 +145,17 @@ go test ./...
 ```
 
 `cmd/service-a` has unit tests for `validateZip` (table-driven, no network)
-and benchmarks for pure OpenTelemetry SDK overhead (see below, also no
-network — no dependency on Jaeger/Zipkin/collector being up).
+and benchmarks for pure OpenTelemetry SDK overhead (see Metrics below, also
+no network — no dependency on Jaeger/Zipkin/collector being up).
 
-## Benchmarks and Tradeoff Analysis
+## Metrics
 
-This pipeline's bottleneck in production is the two external, rate-limited,
-free-tier APIs (ViaCEP, WeatherAPI) it calls — not the Go services or the
+This pipeline's real-world bottleneck is the two external, rate-limited,
+free-tier APIs it calls (ViaCEP, WeatherAPI) — not the Go services or the
 tracing SDK. So instead of a throughput number that would really be
-measuring ViaCEP's rate limiter, the benchmark that's actually informative
-here is: **how much overhead does the OpenTelemetry instrumentation itself
-add per request**, independent of network calls.
+measuring ViaCEP's rate limiter, the informative metric here is: **how much
+overhead does the OpenTelemetry instrumentation itself add per request**,
+independent of network calls.
 
 ```sh
 go test ./cmd/service-a/... -run=^$ -bench=. -benchtime=3s -benchmem
@@ -210,10 +220,10 @@ service:
 | Single backend (e.g. Jaeger only) | Simpler ops, one UI, one storage backend to run/scale | Locked into that backend's query/retention model; migrating later means re-pointing every service |
 | Dual backend via collector (used here) | The collector is the only thing that knows about Jaeger/Zipkin — services just emit OTLP; swapping/adding a backend is a collector-config change, zero code change | Collector does more work per span (batch, fan-out, two export paths); two UIs/datastores to operate |
 
-Keeping services OTLP-only and doing backend fan-out in the collector is
-the correct default: it means this repo could point traces at a different
-backend (Honeycomb, Tempo, Datadog) by editing one YAML file, never
-touching `cmd/service-a` or `cmd/service-b`.
+Keeping services OTLP-only and doing backend fan-out in the collector
+means this repo could point traces at a different backend (Honeycomb,
+Tempo, Datadog) by editing one YAML file, never touching `cmd/service-a`
+or `cmd/service-b`.
 
 ### Tradeoff: synchronous vs batched span export
 
@@ -227,8 +237,8 @@ immediately on every `span.End()`):
 | `BatchSpanProcessor` (used here) | Export happens off the request's critical path, batched; request latency is unaffected by collector latency | Spans sit in an in-memory buffer until flushed — a crash between span-end and flush loses that span; added complexity of a background goroutine |
 
 For a pipeline whose whole point is not adding meaningful latency to the
-request path (see the benchmark above), batched async export is the only
-sane choice — a synchronous exporter would mean every request's latency
+request path (see Metrics above), batched async export is the only sane
+choice — a synchronous exporter would mean every request's latency
 includes however long the OTel collector takes to accept the span.
 
 ## Project layout

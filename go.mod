@@ -1,4 +1,4 @@
-module github.com/dpcamargo/fullcycle-otel
+module github.com/dpcamargo/otel-distributed-tracing-go
 
 go 1.21.1
 

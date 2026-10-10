@@ -1,6 +1,6 @@
 POST http://localhost:8080/ HTTP/1.1
 Content-Type: application/json
-api_key : 9bf5de4adb154913beb174809241011
+api_key : <WEATHER_API_KEY>
 
 {
   "cep": "00000000"
@@ -10,4 +10,4 @@ api_key : 9bf5de4adb154913beb174809241011
 
 GET http://localhost:8081?zip=00000000 HTTP/1.1
 Content-Type: application/json
-api_key : 9bf5de4adb154913beb174809241011
+api_key : <WEATHER_API_KEY>

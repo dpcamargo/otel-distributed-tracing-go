@@ -159,7 +159,7 @@ func getTempFromZip(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &http.Client{}
-	res, err := getTempFromLocal(client, zip.CEP, apiKey)
+	res, err := getTempFromLocal(ctx, client, zip.CEP, apiKey)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -181,7 +181,7 @@ func validateZip(zip string) (string, error) {
 	return zip, nil
 }
 
-func getTempFromLocal(client *http.Client, zip string, apiKey string) (Response, error) {
+func getTempFromLocal(ctx context.Context, client *http.Client, zip string, apiKey string) (Response, error) {
 	baseURL := "http://service-b:8081"
 
 	u, err := url.Parse(baseURL)
@@ -193,17 +193,17 @@ func getTempFromLocal(client *http.Client, zip string, apiKey string) (Response,
 	q.Set("zip", zip)
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequest("GET", u.String(), nil)
+	tracer := otel.Tracer("microservice-tracer")
+	ctx, span := tracer.Start(ctx, "outgoing request to service-b")
+	defer span.End()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
 		log.Println("Error creating request:", err)
 		return Response{}, err
 	}
 
 	req.Header.Add("api_key", apiKey)
-
-	tracer := otel.Tracer("microservice-tracer")
-	ctx, span := tracer.Start(context.Background(), "outgoing request to service-b")
-	defer span.End()
 
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 
